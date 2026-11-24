@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>日本の衛星 軌道アニメーション</title>
+<style>
+:root{--bg:#0e1a2b;--panel:#16263c;--line:#2c4260;--text:#e6edf6;--sub:#93a6bf;--accent:#ffd23f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 "Yu Gothic","Hiragino Sans","Noto Sans JP",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:12px}
+#map{width:100%;height:68vh;min-height:340px}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:8px}
+.bar label{color:var(--sub)}
+select,button,textarea{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}
+button[aria-pressed="true"]{background:var(--accent);color:#1a1a1a;border-color:var(--accent);font-weight:700}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.group{display:flex;gap:6px;flex-wrap:wrap}
+#slider{width:100%;accent-color:var(--accent)}
+.readout{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;color:var(--sub);margin-top:6px}
+.readout strong{color:var(--text)}
+#status{min-height:1.6em;color:var(--sub)}
+#status.err{color:#ff8a7a}
+details{margin-top:8px;color:var(--sub)}
+textarea{width:100%;height:84px;font-family:monospace;font-size:13px;margin:6px 0}
+footer{margin-top:14px;color:var(--sub);font-size:13px}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<main>
+  <div id="map"></div>
+
+  <input id="slider" type="range" min="0" max="600" step="0.1" value="0" aria-label="経過時間">
+  <div class="readout">
+    <span>経過 <strong id="elapsed">0</strong> 分</span>
+    <span>日本時間 <strong id="clock">-</strong></span>
+    <span id="speedLabel"></span>
+  </div>
+
+  <div class="bar">
+    <label for="sat">衛星</label>
+    <select id="sat"></select>
+    <button id="play">▶ 再生</button>
+    <span class="group" id="speeds" role="group" aria-label="再生速度"></span>
+    <span class="group" id="projs" role="group" aria-label="表示形式">
+      <button data-p="orthographic" aria-pressed="true">地球儀</button>
+      <button data-p="natural earth" aria-pressed="false">平面地図</button>
+    </span>
+  </div>
+
+  <div id="status" role="status"></div>
+
+  <details>
+    <summary>軌道データ（TLE）を貼り付けて表示する</summary>
+    <textarea id="tle" placeholder="1 25544U ...&#10;2 25544  51.6 ..."></textarea>
+    <button id="loadTle">この TLE を使う</button>
+  </details>
+
+  <footer>
+    軌道データは <a href="https://celestrak.org/">CelesTrak</a> から取得しています。教育・参考用で、位置の正確さは保証しません。表示は予測であり、リアルタイムの位置ではありません。
+  </footer>
+</main>
+
+<script>
+// ライブラリを読み込む（1つ目のCDNがだめなら、次のCDNを試す）
+function loadScript(urls) {
+  return new Promise((resolve, reject) => {
+    let i = 0;
+    (function next() {
+      if (i >= urls.length) return reject(new Error("ライブラリを読み込めません"));
+      const s = document.createElement("script");
+      s.src = urls[i++];
+      s.onload = resolve;
+      s.onerror = () => { s.remove(); next(); };
+      document.head.appendChild(s);
+    })();
+  });
+}
+const LIBS = Promise.all([
+  loadScript(["https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js",
+              "https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.2/plotly.min.js"]),
+  loadScript(["https://cdn.jsdelivr.net/npm/satellite.js@5.0.0/dist/satellite.min.js",
+              "https://cdnjs.cloudflare.com/ajax/libs/satellite.js/5.0.0/satellite.min.js"]),
+]);
+</script>
+<script>
+// 衛星名: NORAD ID（取得できない場合は番号を確認してください）
+const SATS = {
+  "だいち2号 (ALOS-2)": 39766,
+  "だいち4号 (ALOS-4)": 60182,
+  "いぶき2号 (GOSAT-2)": 43672,
+  "しきさい (GCOM-C)": 43065,
+  "XRISM": 57800,
+  "ひまわり9号": 41836,
+  "みちびき3号 (QZS-3)": 42917,
+  "ISS": 25544,
+};
+const SPEEDS = [1, 10, 100, 200, 500, 1000];
+const SPAN_MIN = 600; // 表示する長さ（分）
+
+const $ = id => document.getElementById(id);
+const map = $("map"), slider = $("slider");
+let satrec = null, t0 = Date.now(), simMs = 0, speed = 100;
+let playing = false, last = performance.now(), dirty = true;
+let proj = "orthographic", trackLat = [], trackLon = [];
+
+// ---- 画面部品の用意 ----
+for (const name of Object.keys(SATS)) $("sat").add(new Option(name, name));
+SPEEDS.forEach(s => {
+  const b = document.createElement("button");
+  b.textContent = s + "倍"; b.dataset.s = s;
+  b.setAttribute("aria-pressed", s === speed);
+  $("speeds").appendChild(b);
+});
+$("speedLabel").textContent = "再生速度: 実時間の " + speed + " 倍";
+
+function status(msg, err) { const e = $("status"); e.textContent = msg; e.className = err ? "err" : ""; }
+
+// ---- TLE 取得と解析 ----
+function parseTLE(text) {
+  const L = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const i = L.findIndex(s => s.startsWith("1 "));
+  if (i < 0 || !L[i + 1] || !L[i + 1].startsWith("2 ")) throw new Error("TLE が見つかりません");
+  return [L[i], L[i + 1]];
+}
+
+async function loadSat(name) {
+  status(name + " の軌道データを取得中…");
+  let tle;
+  try {
+    const url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=" + SATS[name] + "&FORMAT=TLE";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    tle = parseTLE(await res.text());
+  } catch (e) {
+    status(name + " の軌道データを取得できませんでした（" + e.message + "）。下の欄に TLE を貼り付けても表示できます。", true);
+    return;
+  }
+  try {
+    useTLE(...tle, name);
+  } catch (e) {
+    status(name + " の表示に失敗しました（" + e.message + "）。", true);
+  }
+}
+
+function useTLE(l1, l2, name) {
+  satrec = satellite.twoline2satrec(l1, l2);
+  t0 = Date.now(); simMs = 0; dirty = true;
+  const lat = [], lon = [];
+  let prev = null;
+  for (let m = 0; m <= SPAN_MIN; m++) {
+    const p = pos(new Date(t0 + m * 60000));
+    if (!p) continue;
+    if (prev !== null && Math.abs(p[1] - prev) > 180) { lat.push(null); lon.push(null); } // 日付変更線をまたぐ所で線を切る
+    lat.push(p[0]); lon.push(p[1]); prev = p[1];
+  }
+  trackLat = lat; trackLon = lon;
+  drawMap(true);
+  status((name || "TLE") + " を表示中。");
+}
+
+function pos(date) {
+  const pv = satellite.propagate(satrec, date);
+  if (!pv.position) return null;
+  const g = satellite.gstime(date);
+  const p = satellite.eciToGeodetic(pv.position, g);
+  return [satellite.degreesLat(p.latitude), satellite.degreesLong(p.longitude)];
+}
+
+// ---- 描画 ----
+function drawMap(recenter) {
+  const p = pos(new Date(t0 + simMs)) || [0, 0];
+  const geo = {
+    projection: { type: proj }, bgcolor: "rgba(0,0,0,0)",
+    showland: true, landcolor: "#4f6b3a", showocean: true, oceancolor: "#16385c",
+    showlakes: true, lakecolor: "#16385c", showcountries: true, countrycolor: "#8aa0b5",
+    coastlinecolor: "#8aa0b5", lataxis: { showgrid: true, gridcolor: "#2a4a6e" }, lonaxis: { showgrid: true, gridcolor: "#2a4a6e" },
+  };
+  if (proj === "orthographic") geo.projection.rotation = { lon: p[1], lat: Math.max(-60, Math.min(60, p[0])) };
+  Plotly.react(map, [
+    { type: "scattergeo", lat: trackLat, lon: trackLon, mode: "lines", line: { color: "#ff6a5b", width: 2 }, hoverinfo: "skip" },
+    { type: "scattergeo", lat: [p[0]], lon: [p[1]], mode: "markers", marker: { size: 13, color: "#ffd23f", line: { width: 1.5, color: "#0e1a2b" } }, hoverinfo: "skip" },
+  ], { geo, margin: { l: 0, r: 0, t: 0, b: 0 }, paper_bgcolor: "rgba(0,0,0,0)", showlegend: false }, { responsive: true, displayModeBar: false });
+}
+
+// ---- アニメーション（requestAnimationFrame で滑らかに動かす） ----
+function tick(now) {
+  if (playing) { simMs += (now - last) * speed; dirty = true; if (simMs > SPAN_MIN * 60000) simMs = 0; }
+  last = now;
+  if (dirty && satrec) {
+    const d = new Date(t0 + simMs), p = pos(d);
+    if (p) Plotly.restyle(map, { lat: [[p[0]]], lon: [[p[1]]] }, [1]);
+    slider.value = simMs / 60000;
+    $("elapsed").textContent = (simMs / 60000).toFixed(1);
+    $("clock").textContent = d.toLocaleString("ja-JP", { timeZone: "Asia/Tokyo", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    dirty = false;
+  }
+  requestAnimationFrame(tick);
+}
+
+// ---- 操作 ----
+$("sat").onchange = e => loadSat(e.target.value);
+$("play").onclick = () => { playing = !playing; $("play").textContent = playing ? "⏸ 停止" : "▶ 再生"; };
+$("speeds").onclick = e => {
+  const s = e.target.dataset.s; if (!s) return;
+  speed = +s; $("speedLabel").textContent = "再生速度: 実時間の " + speed + " 倍";
+  [...$("speeds").children].forEach(b => b.setAttribute("aria-pressed", b === e.target));
+};
+$("projs").onclick = e => {
+  const p = e.target.dataset.p; if (!p) return;
+  proj = p; [...$("projs").children].forEach(b => b.setAttribute("aria-pressed", b === e.target));
+  if (satrec) drawMap(true);
+};
+slider.oninput = () => { simMs = +slider.value * 60000; dirty = true; };
+$("loadTle").onclick = () => {
+  try { useTLE(...parseTLE($("tle").value)); } catch (e) { status(e.message, true); }
+};
+
+status("ライブラリを読み込み中…");
+LIBS.then(() => {
+  loadSat($("sat").value);
+  requestAnimationFrame(tick);
+}).catch(e => status(e.message + "。インターネット接続や、学校・会社のネットワーク制限を確認してください。", true));
+</script>
+</body>
+</html>
